@@ -1,0 +1,23 @@
+name: check
+description: Check whether a Hub suite or test UUID already passed for this commit.
+inputs:
+  id:
+    description: Suite or test UUID
+    required: true
+  token:
+    description: Hub API token
+    required: true
+outputs:
+  passed:
+    description: true when a passing run exists for this commit
+    value: ${{ steps.check.outputs.passed }}
+runs:
+  using: composite
+  steps:
+    - id: check
+      shell: bash
+      env:
+        RFHUB_TOKEN: ${{ inputs.token }}
+        RFHUB_ID: ${{ inputs.id }}
+        GIT_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+      run: python3 "$GITHUB_ACTION_PATH/../rfhub.py" check

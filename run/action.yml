@@ -1,0 +1,27 @@
+name: run
+description: Queue a Hub suite or test UUID for this commit and wait for the result.
+inputs:
+  id:
+    description: Suite or test UUID
+    required: true
+  token:
+    description: Hub API token
+    required: true
+outputs:
+  handle:
+    description: Hub batch handle
+    value: ${{ steps.run.outputs.handle }}
+  passed:
+    description: true when the queued run passed
+    value: ${{ steps.run.outputs.passed }}
+runs:
+  using: composite
+  steps:
+    - id: run
+      shell: bash
+      env:
+        RFHUB_TOKEN: ${{ inputs.token }}
+        RFHUB_ID: ${{ inputs.id }}
+        GIT_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        GIT_BRANCH: ${{ github.head_ref || github.ref_name }}
+      run: python3 "$GITHUB_ACTION_PATH/../rfhub.py" run
