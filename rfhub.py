@@ -39,6 +39,7 @@ def req(method, path, body=None):
     headers = {
         "Authorization": f"Bearer {TOKEN}",
         "Accept": "application/json",
+        "User-Agent": "rfhub-actions/1.0",
     }
     if body is not None:
         data = json.dumps(body).encode()
