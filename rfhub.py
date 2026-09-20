@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Check or queue a Hub suite/test UUID for the current git SHA."""
+"""Hub GitHub Actions helpers: suite/test check|run, acceptance-check|acceptance-run."""
 
 import json
 import os
@@ -14,8 +14,12 @@ TOKEN = os.environ.get("RFHUB_TOKEN", "").strip()
 RID = os.environ.get("RFHUB_ID", "").strip()
 SHA = os.environ.get("GIT_SHA", "").strip()
 BRANCH = os.environ.get("GIT_BRANCH", "").strip()
-POLL = 15
-WAIT = 900
+PROJECT = os.environ.get("RFHUB_PROJECT", "").strip()
+ACCEPTANCE = os.environ.get("RFHUB_ACCEPTANCE", "pr").strip() or "pr"
+ENVIRONMENT = os.environ.get("RFHUB_ENVIRONMENT", "dev").strip() or "dev"
+POLL = int(os.environ.get("RFHUB_POLL_SECONDS", "15") or "15")
+WAIT = int(os.environ.get("RFHUB_WAIT_SECONDS", "900") or "900")
+ACCEPTANCE_WAIT = int(os.environ.get("RFHUB_ACCEPTANCE_WAIT_SECONDS", "3600") or "3600")
 
 
 def die(msg, code=1):
@@ -145,26 +149,154 @@ def wait(handle):
     die(f"timed out waiting for {handle}")
 
 
-def main():
-    cmd = sys.argv[1] if len(sys.argv) > 1 else ""
-    if cmd not in {"check", "run"}:
-        die("usage: rfhub.py check|run", 2)
-    if not TOKEN:
-        die("RFHUB_TOKEN is empty")
+def list_acceptance_reports():
+    query = urllib.parse.urlencode({"project": PROJECT, "gitSha": SHA})
+    status, payload, raw = req("GET", f"/api/agent/acceptance-reports?{query}")
+    if status != 200 or not isinstance(payload, dict):
+        die(f"GET /api/agent/acceptance-reports failed HTTP {status}: {raw[:400]}")
+    reports = payload.get("reports")
+    return reports if isinstance(reports, list) else []
+
+
+def green_acceptance_report():
+    """A ready+passed report for this definitionSlug+gitSha (not any green run)."""
+    want = ACCEPTANCE.lower()
+    for report in list_acceptance_reports():
+        if not isinstance(report, dict):
+            continue
+        slug = str(report.get("definitionSlug") or "").strip().lower()
+        if slug != want:
+            continue
+        if str(report.get("status") or "").lower() != "ready":
+            continue
+        if str(report.get("verdict") or "").lower() != "passed":
+            continue
+        return report
+    return None
+
+
+def queue_acceptance():
+    if not BRANCH:
+        die("GIT_BRANCH is empty")
+    body = {
+        "project": PROJECT,
+        "branch": BRANCH,
+        "environment": ENVIRONMENT,
+        "gitSha": SHA,
+        "acceptance": ACCEPTANCE,
+    }
+    status, payload, raw = req("POST", "/api/agent/acceptance-runs", body)
+    if status not in {200, 201} or not isinstance(payload, dict):
+        die(f"acceptance-runs failed HTTP {status}: {raw[:500]}")
+    group_id = str(payload.get("groupId") or "")
+    if not group_id:
+        die(f"acceptance-runs response missing groupId: {raw[:400]}")
+    print(f"queued acceptance {ACCEPTANCE} group={group_id} {HUB}/acceptance-runs/{group_id}")
+    return group_id
+
+
+def wait_acceptance(group_id):
+    deadline = time.monotonic() + ACCEPTANCE_WAIT
+    while time.monotonic() < deadline:
+        status, payload, raw = req(
+            "GET", f"/api/agent/acceptance-runs?{urllib.parse.urlencode({'groupId': group_id})}"
+        )
+        if status != 200 or not isinstance(payload, dict):
+            print(f"poll HTTP {status}: {raw[:200]}", file=sys.stderr)
+            time.sleep(POLL)
+            continue
+        group_status = str(payload.get("status") or "").lower()
+        report = payload.get("report") if isinstance(payload.get("report"), dict) else None
+        verdict = str((report or {}).get("verdict") or "").lower() if report else ""
+        report_status = str((report or {}).get("status") or "").lower() if report else ""
+        print(
+            f"  group={group_status} report={report_status or '-'} verdict={verdict or '-'}"
+        )
+        if group_status in {"running", "queued", ""}:
+            time.sleep(POLL)
+            continue
+        if group_status == "cancelled":
+            die(f"acceptance cancelled {group_id}")
+        if group_status == "merged":
+            if report_status == "ready" and verdict == "passed":
+                return report
+            die(
+                f"acceptance merged but not green group={group_id} "
+                f"report={report_status} verdict={verdict} {HUB}/acceptance-runs/{group_id}"
+            )
+        # completed/failed without merge yet — keep waiting briefly for report auto-create
+        if group_status in {"completed", "failed"} and not report:
+            time.sleep(POLL)
+            continue
+        if group_status == "failed":
+            die(f"acceptance failed {group_id} {HUB}/acceptance-runs/{group_id}")
+        time.sleep(POLL)
+    die(f"timed out waiting for acceptance {group_id}")
+
+
+def cmd_check():
     if not RID or not SHA:
         die("RFHUB_ID and GIT_SHA are required")
-    if cmd == "check":
-        ok = already_passed()
-        out(passed="true" if ok else "false")
-        if not ok:
-            die(f"{RID} has no passing run for {SHA[:12]}")
-        print(f"{RID} passed on {SHA[:12]}")
-        return
+    ok = already_passed()
+    out(passed="true" if ok else "false")
+    if not ok:
+        die(f"{RID} has no passing run for {SHA[:12]}")
+    print(f"{RID} passed on {SHA[:12]}")
+
+
+def cmd_run():
+    if not RID or not SHA:
+        die("RFHUB_ID and GIT_SHA are required")
     handle = queue()
     out(handle=handle, passed="false")
     wait(handle)
     out(passed="true")
     print(f"{RID} passed {handle}")
+
+
+def cmd_acceptance_check():
+    if not PROJECT or not SHA:
+        die("RFHUB_PROJECT and GIT_SHA are required")
+    report = green_acceptance_report()
+    if not report:
+        out(passed="false")
+        die(f"acceptance '{ACCEPTANCE}' has no green report for {SHA[:12]}")
+    report_id = str(report.get("id") or "")
+    out(passed="true", reportId=report_id)
+    print(f"acceptance '{ACCEPTANCE}' green report {report_id} on {SHA[:12]}")
+
+
+def cmd_acceptance_run():
+    if not PROJECT or not SHA:
+        die("RFHUB_PROJECT and GIT_SHA are required")
+    existing = green_acceptance_report()
+    if existing:
+        report_id = str(existing.get("id") or "")
+        out(passed="true", reportId=report_id, groupId="")
+        print(f"acceptance '{ACCEPTANCE}' already green {report_id} on {SHA[:12]}")
+        return
+    group_id = queue_acceptance()
+    out(groupId=group_id, passed="false")
+    report = wait_acceptance(group_id)
+    report_id = str((report or {}).get("id") or "")
+    out(passed="true", reportId=report_id)
+    print(f"acceptance '{ACCEPTANCE}' passed report={report_id} group={group_id}")
+
+
+def main():
+    cmd = sys.argv[1] if len(sys.argv) > 1 else ""
+    if cmd not in {"check", "run", "acceptance-check", "acceptance-run"}:
+        die("usage: rfhub.py check|run|acceptance-check|acceptance-run", 2)
+    if not TOKEN:
+        die("RFHUB_TOKEN is empty")
+    if cmd == "check":
+        cmd_check()
+    elif cmd == "run":
+        cmd_run()
+    elif cmd == "acceptance-check":
+        cmd_acceptance_check()
+    else:
+        cmd_acceptance_run()
 
 
 if __name__ == "__main__":
