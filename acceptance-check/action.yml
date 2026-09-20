@@ -1,0 +1,33 @@
+name: acceptance-check
+description: >-
+  Succeeds when Hub already has a ready+passed acceptance report for this
+  commit and acceptance definition slug (default pr).
+inputs:
+  project:
+    description: Hub project id or display name
+    required: true
+  token:
+    description: Hub API token
+    required: true
+  acceptance:
+    description: Acceptance definition slug
+    required: false
+    default: pr
+outputs:
+  passed:
+    description: true when a green acceptance report exists for this commit
+    value: ${{ steps.check.outputs.passed }}
+  reportId:
+    description: Acceptance report id when passed
+    value: ${{ steps.check.outputs.reportId }}
+runs:
+  using: composite
+  steps:
+    - id: check
+      shell: bash
+      env:
+        RFHUB_TOKEN: ${{ inputs.token }}
+        RFHUB_PROJECT: ${{ inputs.project }}
+        RFHUB_ACCEPTANCE: ${{ inputs.acceptance }}
+        GIT_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+      run: python3 "$GITHUB_ACTION_PATH/../rfhub.py" acceptance-check
